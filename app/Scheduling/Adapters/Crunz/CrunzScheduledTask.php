@@ -7,112 +7,108 @@ namespace App\Scheduling\Adapters\Crunz;
 use App\Scheduling\Contracts\Mutex;
 use App\Scheduling\Contracts\ScheduledTask;
 use Closure;
-use Cron\CronExpression;
-use DateTimeImmutable;
+use Crunz\Event as CrunzEvent;
 use DateTimeZone;
 use Psr\Log\LoggerInterface;
 use Throwable;
 
+/**
+ * Wraps a Crunz Event for cron expression / due-time evaluation, but executes
+ * the user callback in the host Laravel process — not via Crunz's
+ * subprocess-based Event::start(). That keeps the bus, container, and config
+ * available to the queued job or artisan command we are running.
+ */
 final class CrunzScheduledTask implements ScheduledTask
 {
-    private string $cronExpression = '* * * * *';
-
-    private string $timezone = 'UTC';
-
-    private ?string $taskName = null;
+    private DateTimeZone $timezone;
 
     private ?int $overlapTtl = null;
 
     private bool $onOneServer = false;
 
+    private ?string $taskName = null;
+
     public function __construct(
+        private readonly CrunzEvent $event,
         private readonly Closure $callback,
-        private readonly Mutex $mutex,
-        private readonly LoggerInterface $logger,
-    ) {}
+    ) {
+        $this->timezone = new DateTimeZone(date_default_timezone_get());
+    }
 
     public function everyMinute(): self
     {
-        $this->cronExpression = '* * * * *';
+        $this->event->everyMinute();
 
         return $this;
     }
 
     public function everyFiveMinutes(): self
     {
-        $this->cronExpression = '*/5 * * * *';
+        $this->event->everyFiveMinutes();
 
         return $this;
     }
 
     public function everyFifteenMinutes(): self
     {
-        $this->cronExpression = '*/15 * * * *';
+        $this->event->everyFifteenMinutes();
 
         return $this;
     }
 
     public function hourly(): self
     {
-        $this->cronExpression = '0 * * * *';
+        $this->event->hourly();
 
         return $this;
     }
 
     public function hourlyAt(int $minute): self
     {
-        $this->cronExpression = "{$minute} * * * *";
+        $this->event->hourlyAt($minute);
 
         return $this;
     }
 
     public function daily(): self
     {
-        $this->cronExpression = '0 0 * * *';
+        $this->event->daily();
 
         return $this;
     }
 
     public function dailyAt(string $time): self
     {
-        [$h, $m] = explode(':', $time);
-        $this->cronExpression = "{$m} {$h} * * *";
+        $this->event->dailyAt($time);
 
         return $this;
     }
 
     public function weekly(): self
     {
-        $this->cronExpression = '0 0 * * 0';
+        $this->event->weekly();
 
         return $this;
     }
 
     public function monthly(): self
     {
-        $this->cronExpression = '0 0 1 * *';
+        $this->event->monthly();
 
         return $this;
     }
 
     public function cron(string $expression): self
     {
-        new CronExpression($expression);
-        $this->cronExpression = $expression;
+        $this->event->cron($expression);
 
         return $this;
     }
 
     public function timezone(string $timezone): self
     {
-        $this->timezone = $timezone;
-
-        return $this;
-    }
-
-    public function name(string $name): self
-    {
-        $this->taskName = $name;
+        $this->timezone = new DateTimeZone($timezone);
+        $this->event->timezone($this->timezone);
 
         return $this;
     }
@@ -131,46 +127,61 @@ final class CrunzScheduledTask implements ScheduledTask
         return $this;
     }
 
-    public function runIfDue(DateTimeImmutable $now): void
+    public function name(string $name): self
     {
-        $cron = new CronExpression($this->cronExpression);
-        $nowInTz = $now->setTimezone(new DateTimeZone($this->timezone));
+        $this->taskName = $name;
+        $this->event->description($name);
 
-        if (! $cron->isDue($nowInTz)) {
+        return $this;
+    }
+
+    public function runIfDue(Mutex $mutex, LoggerInterface $logger): void
+    {
+        if (! $this->event->isDue($this->timezone)) {
             return;
         }
 
-        $key = $this->lockKey();
         $needsLock = $this->overlapTtl !== null || $this->onOneServer;
 
         if ($needsLock) {
+            $key = $this->lockKey();
             $ttl = $this->overlapTtl ?? 60;
-            if (! $this->mutex->acquire($key, $ttl)) {
-                $this->logger->info('Scheduler task skipped (locked)', [
+
+            if (! $mutex->acquire($key, $ttl)) {
+                $logger->info('Scheduler task skipped (locked)', [
                     'task' => $this->taskName,
                     'key' => $key,
                 ]);
 
                 return;
             }
+
+            try {
+                ($this->callback)();
+            } catch (Throwable $e) {
+                $logger->error('Scheduler task failed', [
+                    'task' => $this->taskName,
+                    'exception' => $e,
+                ]);
+            } finally {
+                $mutex->release($key);
+            }
+
+            return;
         }
 
         try {
             ($this->callback)();
         } catch (Throwable $e) {
-            $this->logger->error('Scheduler task failed', [
+            $logger->error('Scheduler task failed', [
                 'task' => $this->taskName,
                 'exception' => $e,
             ]);
-        } finally {
-            if ($needsLock) {
-                $this->mutex->release($key);
-            }
         }
     }
 
     private function lockKey(): string
     {
-        return 'scheduler:'.($this->taskName ?? sha1($this->cronExpression));
+        return 'scheduler:'.($this->taskName ?? sha1($this->event->getExpression()));
     }
 }

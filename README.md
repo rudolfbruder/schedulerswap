@@ -7,7 +7,7 @@ A small Laravel 13 demo that swaps its task scheduler at runtime via an env var.
 
 ```
 SCHEDULER_TYPE=laravel   # delegates to Illuminate\Console\Scheduling\Schedule
-SCHEDULER_TYPE=crunz     # hand-rolled Crunz-style adapter (no external package)
+SCHEDULER_TYPE=crunz     # delegates to crunzphp/crunz (Crunz\Schedule + Crunz\Event)
 ```
 
 ---
@@ -64,11 +64,17 @@ Two long-running processes. Open two shells.
 composer dev
 ```
 
-**Shell 2 — scheduler daemon** (ticks every minute, dispatches due tasks through whichever engine is bound):
+**Shell 2 — scheduler tick.** Pick one:
 
 ```bash
+# Option A: long-running daemon, ticks itself every minute, engine-agnostic
 php artisan scheduler:work
+
+# Option B: standard Laravel cron entry / Herd's "Run Scheduler" toggle
+* * * * * cd /path/to/schedulerswap && php artisan schedule:run >> /dev/null 2>&1
 ```
+
+Both paths run the bundled `HeartbeatJob` on either engine. `schedule:run` works on Crunz mode because `bootstrap/app.php` bridges a one-minute tick from Laravel's `Schedule` into the portable `Scheduler` (skipped on `SCHEDULER_TYPE=laravel` to avoid recursion — Laravel-mode tasks already live on `Schedule`).
 
 The bundled `HeartbeatJob` is registered in `bootstrap/app.php` via the portable `Scheduler` interface and runs every minute. Watch the heartbeat:
 
@@ -158,13 +164,27 @@ app/Scheduling/
 │   └── Mutex.php            ← locking port
 └── Adapters/
     ├── Laravel/             ← delegates to Illuminate\Console\Scheduling\Schedule
-    ├── Crunz/               ← Crunz-style runner, dispatches via the bus
+    ├── Crunz/               ← wraps crunzphp/crunz Event for cron + isDue, runs callback in-process
     └── Cache/CacheMutex.php ← Mutex impl over Laravel cache locks
 ```
 
-Both adapters resolve `Mutex` from the container, so swapping the lock store (database, Redis, Memcached, DynamoDB) is a config change, not a code change.
-
 A long-running `scheduler:work` daemon ticks once a minute and calls `Scheduler::runDue($now)` — the same loop drives both engines.
+
+### Locking
+
+Both engines route overlap prevention through one contract: `App\Scheduling\Contracts\Mutex` (`acquire / release / exists`). The shipped implementation is `App\Scheduling\Adapters\Cache\CacheMutex`, backed by Laravel's cache locks (`Illuminate\Contracts\Cache\Repository::lock`).
+
+- **Fencing tokens.** Each `acquire()` mints a 16-byte hex owner token, stashes it in a per-process map, and only `restoreLock($key, $owner)->release()` succeeds — a stale or impostor caller cannot release someone else's lock. Verified by `tests/Feature/CacheMutexTest.php`.
+- **Store override.** The mutex resolves the cache store from `config('scheduler.mutex_cache_store')` (env: `SCHEDULER_MUTEX_STORE`). Any cache driver that supports locks works: `database`, `redis`, `memcached`, `dynamodb`. Default = `null` = the app's default cache store, which is `database` per `.env`.
+- **Same lock across engines.** `Mutex` is a singleton bound in `SchedulingServiceProvider::register()`. Swapping `SCHEDULER_TYPE` between `laravel` and `crunz` does not touch the locking story — both engines see the same `CacheMutex` instance and the same backing store.
+
+### Crunz integration note
+
+The Crunz adapter wraps a real `Crunz\Event` for the fluent cron API and `isDue()` evaluation, but **does not** call `Event::start()` — that path serializes the closure and runs it in a fresh subprocess via `bin/crunz closure:run`, which would lose the Laravel container, bus, and config. The host process invokes the original callback directly.
+
+Crunz's own `Event::preventOverlapping()` (which wants a Symfony `PersistingStoreInterface`) is **also bypassed** for the same reason — it's wired into the `start()` pipeline. Instead, `withoutOverlapping($ttl)` and `onOneServer()` set flags on the `CrunzScheduledTask` wrapper; `runIfDue()` calls our `Mutex` around the callback. Lock key is `'scheduler:'.($name ?? sha1($event->getExpression()))` — task name if set, else hash of the cron expression Crunz computed.
+
+Net split: **Crunz owns cron + due-time math; schedulerswap owns execution and concurrency.**
 
 ## Tests
 
@@ -183,10 +203,11 @@ Key coverage:
 ## Stack
 
 - PHP 8.4, Laravel 13, Pest 4
+- [`crunzphp/crunz`](https://github.com/crunzphp/crunz) ^3.9 — second scheduler engine
 - Tailwind v4 + Vite 8 (frontend is the default Laravel welcome page; this demo is backend-only)
 - SQLite for app data, cache, sessions, queue, jobs (`DB_CONNECTION=sqlite`, all `*_DRIVER=database`)
 - [Laravel Boost](https://laravel.com/docs/ai) MCP server enabled for agent-assisted development
 
 ## Scope notes
 
-Portfolio piece, not a production scheduler. Multi-host coordination, fencing tokens, distributed-lock edge cases, and full feature parity with Laravel's scheduler are intentionally out of scope. The point is the seam, not the cluster.
+Portfolio piece, not a production scheduler. Multi-host coordination, distributed-lock edge cases (clock skew, partial failure mid-run), and full feature parity with Laravel's scheduler are intentionally out of scope. Fencing tokens are implemented for the cache-backed mutex, but the only `Mutex` impl shipped is single-store and process-local in its owner map — durable cross-host fencing would need a different adapter. The point is the seam, not the cluster.

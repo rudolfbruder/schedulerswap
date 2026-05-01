@@ -20,6 +20,16 @@ return Application::configure(basePath: dirname(__DIR__))
         $scheduler->job(new HeartbeatJob)
             ->everyMinute()
             ->name('heartbeat-log');
+
+        // Non-Laravel engines do not register on Illuminate\Console\Scheduling\Schedule,
+        // so cron-driven `schedule:run` would be a no-op. Bridge a one-minute tick
+        // through to the portable Scheduler. Skipped for the Laravel engine because
+        // its tasks already live on this Schedule and would otherwise recurse.
+        if (config('scheduler.type') !== 'laravel') {
+            $schedule->call(fn () => $scheduler->runDue(new DateTimeImmutable('now')))
+                ->everyMinute()
+                ->name('portable-scheduler-tick');
+        }
     })
     ->withMiddleware(function (Middleware $middleware): void {
         //
