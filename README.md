@@ -64,21 +64,19 @@ Two long-running processes. Open two shells.
 composer dev
 ```
 
-**Shell 2 — scheduler tick.** One command, both engines:
+**Shell 2 — scheduler daemon.** One command, both engines, no cron required:
 
 ```bash
-php artisan schedule:run
+php artisan scheduler:work
 ```
 
-Run it every minute via cron or Herd's "Run Scheduler" toggle:
+`SchedulerWorkCommand` resolves the portable `Scheduler` from the container, sleeps to the next minute boundary, and calls `Scheduler::runDue($now)` on every tick. The bound implementation is whatever `SCHEDULER_TYPE` selected — Laravel or Crunz — so this is the canonical entry point regardless of engine. Run it under `supervisor` / `systemd` / `launchd` in production, or just leave it open in a shell during the demo.
+
+If you prefer the standard Laravel cron pattern, `php artisan schedule:run` also works on both engines (`bootstrap/app.php` bridges a one-minute tick into the portable `Scheduler` when `SCHEDULER_TYPE != laravel`, skipped on Laravel mode to avoid `LaravelScheduler::runDue → schedule:run` recursion):
 
 ```cron
 * * * * * cd /path/to/schedulerswap && php artisan schedule:run >> /dev/null 2>&1
 ```
-
-That's the only command you need. `bootstrap/app.php` bridges a one-minute tick from Laravel's `Schedule` into the portable `Scheduler` when `SCHEDULER_TYPE != laravel`, so the same `schedule:run` drives the Laravel engine natively and the Crunz engine through the bridge. (Bridge skipped on Laravel mode to avoid `LaravelScheduler::runDue → schedule:run` recursion.)
-
-If you'd rather not rely on cron, `php artisan scheduler:work` is a self-ticking daemon that calls `Scheduler::runDue($now)` each minute on either engine — same outcome, no external trigger.
 
 The bundled `HeartbeatJob` is registered in `bootstrap/app.php` via the portable `Scheduler` interface and runs every minute. Watch the heartbeat:
 
