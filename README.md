@@ -16,69 +16,40 @@ SCHEDULER_TYPE=crunz     # delegates to crunzphp/crunz (Crunz\Schedule + Crunz\E
 
 - PHP **8.4+**
 - Composer 2
-- Node 20+ / npm
-- SQLite (the bundled `database/database.sqlite` file is enough)
-- [Laravel Herd](https://herd.laravel.com) for local serving — the app expects `http://schedulerswap.test`
+- SQLite (bundled `database/database.sqlite` file is enough)
 
-No Redis, no MySQL, no external services. Cache, sessions, queue, and jobs all live in SQLite via the `database` driver.
+Backend-only demo. No web server, no Redis, no MySQL, no Node, no frontend build. Cache, sessions, queue, and jobs all live in SQLite via the `database` driver.
 
 ## Install
 
 ```bash
-# 1. Clone and enter
 git clone <repo-url> schedulerswap
 cd schedulerswap
 
-# 2. PHP + JS deps
 composer install
-npm install
 
-# 3. Env + app key
 cp .env.example .env
 php artisan key:generate
 
-# 4. SQLite file + schema (creates cache, sessions, jobs, failed_jobs tables too)
 touch database/database.sqlite
 php artisan migrate
-
-# 5. Frontend assets (one-shot build, or use composer dev below for watch mode)
-npm run build
 ```
-
-Herd should auto-detect the directory and serve it at `http://schedulerswap.test`. If not:
-
-```bash
-herd link
-herd open
-```
-
-> Do **not** run `php artisan serve` — Herd already serves the site, and the dev script below assumes it.
 
 ## Run
 
-Two long-running processes. Open two shells.
-
-**Shell 1 — dev stack** (Vite watch + queue worker + log tail, all via `concurrently`):
+`SchedulerWorkCommand` is the canonical entry point — engine-agnostic, no cron, no extra processes. Open one shell:
 
 ```bash
-composer dev
-```
+# In another shell, run the queue worker so dispatched jobs actually execute:
+php artisan queue:work
 
-**Shell 2 — scheduler daemon.** One command, both engines, no cron required:
-
-```bash
+# Then start the scheduler daemon:
 php artisan scheduler:work
 ```
 
-`SchedulerWorkCommand` resolves the portable `Scheduler` from the container, sleeps to the next minute boundary, and calls `Scheduler::runDue($now)` on every tick. The bound implementation is whatever `SCHEDULER_TYPE` selected — Laravel or Crunz — so this is the canonical entry point regardless of engine. Run it under `supervisor` / `systemd` / `launchd` in production, or just leave it open in a shell during the demo.
+`scheduler:work` resolves the portable `Scheduler` from the container, sleeps to the next minute boundary, and calls `Scheduler::runDue($now)` on every tick. The bound implementation is whatever `SCHEDULER_TYPE` selected — Laravel or Crunz.
 
-If you prefer the standard Laravel cron pattern, `php artisan schedule:run` also works on both engines (`bootstrap/app.php` bridges a one-minute tick into the portable `Scheduler` when `SCHEDULER_TYPE != laravel`, skipped on Laravel mode to avoid `LaravelScheduler::runDue → schedule:run` recursion):
-
-```cron
-* * * * * cd /path/to/schedulerswap && php artisan schedule:run >> /dev/null 2>&1
-```
-
-The bundled `HeartbeatJob` is registered in `bootstrap/app.php` via the portable `Scheduler` interface and runs every minute. Watch the heartbeat:
+The bundled `HeartbeatJob` is registered in `bootstrap/app.php` and runs every minute. Watch it land:
 
 ```bash
 php artisan pail
@@ -92,6 +63,8 @@ php artisan scheduler:debug
 ```
 
 That prints the resolved `Scheduler` and `Mutex` classes and runs a live mutex acquire / exists / release round-trip.
+
+> Note: `php artisan schedule:run` also works on both engines (`bootstrap/app.php` bridges into the portable `Scheduler` when `SCHEDULER_TYPE != laravel`), in case you'd rather drive ticks from cron. Not required for the demo.
 
 ---
 
@@ -206,7 +179,6 @@ Key coverage:
 
 - PHP 8.4, Laravel 13, Pest 4
 - [`crunzphp/crunz`](https://github.com/crunzphp/crunz) ^3.9 — second scheduler engine
-- Tailwind v4 + Vite 8 (frontend is the default Laravel welcome page; this demo is backend-only)
 - SQLite for app data, cache, sessions, queue, jobs (`DB_CONNECTION=sqlite`, all `*_DRIVER=database`)
 - [Laravel Boost](https://laravel.com/docs/ai) MCP server enabled for agent-assisted development
 
